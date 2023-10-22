@@ -219,3 +219,5 @@ tags
 
 package/*
 *.zip
+
+.coverage

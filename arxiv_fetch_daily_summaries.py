@@ -1,28 +1,12 @@
-"""
-Copyright © 2023 Brad Edwards
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-arxiv-fetch-daily-summaries.py
-"""
+"""arxiv_fetch_daily_summaries.py"""
 
 import json
 import time
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import boto3
 import requests
-from xml.etree import ElementTree as ET
+import xml.etree.ElementTree as ET
 
 
 def lambda_handler(event: dict, context) -> dict:
@@ -36,17 +20,17 @@ def lambda_handler(event: dict, context) -> dict:
     Returns:
         dict: A dict with a status code and message.
     """
-    base_url = event.get('base_url')
-    bucket_name = event.get('bucket_name')
-    from_date = event.get('from_date')
-    summary_set = event.get('summary_set')
+    base_url = event.get("base_url")
+    bucket_name = event.get("bucket_name")
+    from_date = event.get("from_date")
+    summary_set = event.get("summary_set")
 
     full_xml_responses = fetch_arxiv_data(base_url, from_date, summary_set)
     upload_to_s3(bucket_name, from_date, summary_set, full_xml_responses)
 
     return {
-        'statusCode': 200,
-        'body': f"Successfully fetched arXiv daily summaries from {from_date}"
+        "statusCode": 200,
+        "body": f"Successfully fetched arXiv daily summaries from {from_date}",
     }
 
 
@@ -71,7 +55,7 @@ def fetch_arxiv_data(base_url: str, from_date: str, summary_set: str) -> List[st
             full_xml_responses.append(response)
 
         if resumption_token:
-            params = {'verb': 'ListRecords', 'resumptionToken': resumption_token}
+            params = {"verb": "ListRecords", "resumptionToken": resumption_token}
             time.sleep(5)
         else:
             break
@@ -91,14 +75,16 @@ def initialize_params(from_date: str, summary_set: str) -> dict:
         dict: A dict of parameters for the arXiv OAI-PMH endpoint.
     """
     return {
-        'verb': 'ListRecords',
-        'set': summary_set,
-        'metadataPrefix': 'oai_dc',
-        'from': from_date
+        "verb": "ListRecords",
+        "set": summary_set,
+        "metadataPrefix": "oai_dc",
+        "from": from_date,
     }
 
 
-def fetch_data_from_endpoint(base_url: str, params: dict) -> Tuple[Optional[str], Optional[str]]:
+def fetch_data_from_endpoint(
+    base_url: str, params: dict
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Fetches data from the arXiv OAI-PMH endpoint.
 
@@ -148,7 +134,9 @@ def find_resumption_token(root: ET.Element) -> Optional[ET.Element]:
     return root.find(".//{http://www.openarchives.org/OAI/2.0/}resumptionToken")
 
 
-def handle_http_error(e: Exception, response: requests.Response, backoff_times: List[int]):
+def handle_http_error(
+    e: Exception, response: requests.Response, backoff_times: List[int]
+):
     """
     Handles HTTP errors.
 
@@ -162,12 +150,16 @@ def handle_http_error(e: Exception, response: requests.Response, backoff_times: 
     """
     print(f"HTTP error occurred: {e}")
     if response.status_code == 503:
-        backoff_time = response.headers.get('Retry-After', backoff_times.pop(0) if backoff_times else 30)
+        backoff_time = response.headers.get(
+            "Retry-After", backoff_times.pop(0) if backoff_times else 30
+        )
         print(f"Received 503 error, backing off for {backoff_time} seconds.")
         time.sleep(int(backoff_time))
 
 
-def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_responses: List[str]):
+def upload_to_s3(
+    bucket_name: str, from_date: str, summary_set: str, full_xml_responses: List[str]
+):
     """
     Uploads the XML responses to S3.
 
@@ -180,7 +172,9 @@ def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_re
     Returns:
         None
     """
-    s3 = boto3.client('s3')
-    s3.put_object(Body=json.dumps(full_xml_responses),
-                  Bucket=bucket_name,
-                  Key=f"arxiv/{summary_set}-{from_date}.json")
+    s3 = boto3.client("s3")
+    s3.put_object(
+        Body=json.dumps(full_xml_responses),
+        Bucket=bucket_name,
+        Key=f"arxiv/{summary_set}-{from_date}.json",
+    )
