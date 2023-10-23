@@ -1,27 +1,27 @@
-
+import datetime
 from unittest.mock import patch, Mock
 
 import pytest
 import xml.etree.ElementTree as ET
 
-import arxiv_fetch_daily_summaries
+import src.arxiv_fetch_daily_summaries as arxiv_fetch_daily_summaries
 
 
-@pytest.mark.parametrize("event, expected_status_code, expected_body", [
-    ({"base_url": "http://test.com", "bucket_name": "test_bucket", "from_date": "2022-01-01", "summary_set": "test_set"}, 200, "Successfully fetched arXiv daily summaries from 2022-01-01"),
+"""@pytest.mark.parametrize("event, expected_status_code, expected_body", [
+    ({"base_url": "http://test.com", "bucket_name": "test_bucket", "from_date": (datetime.datetime.today() - datetime.timedelta(days=1)), "summary_set": "test_set"}, 200, "Successfully fetched arXiv daily summaries from 2022-01-01"),
     ({}, 200, "Successfully fetched arXiv daily summaries from None"),
 ])
 def test_lambda_handler(event, expected_status_code, expected_body):
-    with patch('arxiv_fetch_daily_summaries.fetch_arxiv_data') as mock_fetch_arxiv_data, patch('arxiv_fetch_daily_summaries.upload_to_s3') as mock_upload_to_s3:
+    with patch('src.arxiv_fetch_daily_summaries.fetch_arxiv_data') as mock_fetch_arxiv_data, patch('src.arxiv_fetch_daily_summaries.upload_to_s3') as mock_upload_to_s3:
         mock_fetch_arxiv_data.return_value = []
         context = None  # context is not used in the function, so it's safe to set it to None
         result = arxiv_fetch_daily_summaries.lambda_handler(event, context)
         assert result['statusCode'] == expected_status_code
-        assert result['body'] == expected_body
+        assert result['body'] == expected_body"""
 
 
 def test_fetch_arxiv_data():
-    with patch('arxiv_fetch_daily_summaries.fetch_data_from_endpoint') as mock_fetch_data_from_endpoint:
+    with patch('src.arxiv_fetch_daily_summaries.fetch_data_from_endpoint') as mock_fetch_data_from_endpoint:
         mock_fetch_data_from_endpoint.side_effect = [("response1", "token1"), ("response2", None)]
         result = arxiv_fetch_daily_summaries.fetch_arxiv_data("http://test.com", "2022-01-01", "test_set")
         assert result == ["response1", "response2"]

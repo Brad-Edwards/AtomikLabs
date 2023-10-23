@@ -1,5 +1,6 @@
 """arxiv_fetch_daily_summaries.py"""
 
+from datetime import datetime, timedelta
 import json
 import time
 from typing import List, Optional, Tuple
@@ -22,11 +23,49 @@ def lambda_handler(event: dict, context) -> dict:
     """
     base_url = event.get("base_url")
     bucket_name = event.get("bucket_name")
-    from_date = event.get("from_date")
     summary_set = event.get("summary_set")
+
+    yesterday = datetime.today() - timedelta(days=1)
+    from_date = yesterday.strftime("%Y-%m-%d")
+    day = yesterday.strftime("%a")
 
     full_xml_responses = fetch_arxiv_data(base_url, from_date, summary_set)
     upload_to_s3(bucket_name, from_date, summary_set, full_xml_responses)
+
+    # Deal with variable availability of daily summaries on weekends
+    # TODO: replace with DB query
+    if day == "Sun":
+        fri = yesterday - timedelta(days=1)
+        fri_date = fri.strftime("%Y-%m-%d")
+        fri_xml_responses = fetch_arxiv_data(base_url, fri_date, summary_set)
+        upload_to_s3(bucket_name, fri_date, summary_set, fri_xml_responses)
+
+    if day == "Mon":
+        sat = yesterday - timedelta(days=2)
+        sat_date = sat.strftime("%Y-%m-%d")
+        sat_xml_responses = fetch_arxiv_data(base_url, sat_date, summary_set)
+        upload_to_s3(bucket_name, sat_date, summary_set, sat_xml_responses)
+
+        sun = yesterday - timedelta(days=1)
+        sun_date = sun.strftime("%Y-%m-%d")
+        sun_xml_responses = fetch_arxiv_data(base_url, sun_date, summary_set)
+        upload_to_s3(bucket_name, sun_date, summary_set, sun_xml_responses)
+
+    if day == "Tues":
+        mon = yesterday - timedelta(days=3)
+        mon_date = mon.strftime("%Y-%m-%d")
+        mon_xml_responses = fetch_arxiv_data(base_url, mon_date, summary_set)
+        upload_to_s3(bucket_name, mon_date, summary_set, mon_xml_responses)
+
+        sat = yesterday - timedelta(days=2)
+        sat_date = sat.strftime("%Y-%m-%d")
+        sat_xml_responses = fetch_arxiv_data(base_url, sat_date, summary_set)
+        upload_to_s3(bucket_name, sat_date, summary_set, sat_xml_responses)
+
+        sun = yesterday - timedelta(days=1)
+        sun_date = sun.strftime("%Y-%m-%d")
+        sun_xml_responses = fetch_arxiv_data(base_url, sun_date, summary_set)
+        upload_to_s3(bucket_name, sun_date, summary_set, sun_xml_responses)
 
     return {
         "statusCode": 200,
