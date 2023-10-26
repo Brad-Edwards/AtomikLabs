@@ -5,7 +5,7 @@ from collections import defaultdict
 import xml.etree.ElementTree as ET
 import boto3
 
-from package.botocore.client import BaseClient
+from botocore.client import BaseClient
 
 cs_categories_inverted = {
     'Computer Science - Artifical Intelligence': 'AI',
