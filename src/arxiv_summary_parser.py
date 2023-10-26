@@ -188,7 +188,7 @@ def upload_to_s3(client: BaseClient, data: dict, key: str) -> None:
     """
     s3 = client
     bucket_name = "techcraftingai-data-processing"
-    object_name = f"arxiv/{key}-parsed.json"
+    object_name = f"parsed_data/{key}-parsed.json"
     s3.put_object(
         Body=json.dumps(data),
         Bucket=bucket_name,
@@ -219,21 +219,3 @@ def lambda_handler(event: dict, context) -> dict:
         "statusCode": 200,
         "body": "Successfully parsed arXiv daily summaries"
     }
-
-
-if __name__ == "__main__":
-    test_event = {
-        "Records": [
-            {
-                "s3": {
-                    "bucket": {
-                        "name": "techcraftingai-inbound-data"
-                    },
-                    "object": {
-                        "key": "arxiv/cs-2023-10-24.json"
-                    }
-                }
-            }
-        ]
-    }
-    lambda_handler(test_event, None)
