@@ -1,100 +1,84 @@
-"""arxiv_fetch_daily_summaries.py"""
-
-from datetime import datetime, timedelta
-import json
+import datetime
+import logging
 import time
-from typing import List, Optional, Tuple
+from typing import List
 
 import boto3
 import requests
 import xml.etree.ElementTree as ET
 
+DEBUG = False
+
+
+logging.basicConfig(
+    filename='arxiv_fetch_daily_summaries.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
 
 def lambda_handler(event: dict, context) -> dict:
-    """
-    Fetches arXiv daily summaries from the specified date and uploads them to S3.
+    """Main function to fetch arXiv summaries and upload them to S3.
 
     Args:
-        event (dict): The event data passed to the function.
-        context (LambdaContext): The context in which the function is called.
+        event (dict): Event data containing parameters.
+        context: AWS Lambda context.
 
     Returns:
-        dict: A dict with a status code and message.
+        dict: Response with status and message.
     """
+    logging.info(f"Received event: {event}")
+    logging.info("Starting to fetch arXiv daily summaries")
     base_url = event.get("base_url")
     bucket_name = event.get("bucket_name")
+    from_date = event.get("from_date")
     summary_set = event.get("summary_set")
 
-    yesterday = datetime.today() - timedelta(days=1)
-    from_date = yesterday.strftime("%Y-%m-%d")
-    day = yesterday.strftime("%a")
-
-    full_xml_responses = fetch_arxiv_data(base_url, from_date, summary_set)
+    full_xml_responses = fetch_data(base_url, from_date, summary_set)
     upload_to_s3(bucket_name, from_date, summary_set, full_xml_responses)
 
-    # Deal with variable availability of daily summaries on weekends
-    # TODO: replace with DB query
-    if day == "Sun":
-        fri = yesterday - timedelta(days=1)
-        fri_date = fri.strftime("%Y-%m-%d")
-        fri_xml_responses = fetch_arxiv_data(base_url, fri_date, summary_set)
-        upload_to_s3(bucket_name, fri_date, summary_set, fri_xml_responses)
-
-    if day == "Mon":
-        sat = yesterday - timedelta(days=2)
-        sat_date = sat.strftime("%Y-%m-%d")
-        sat_xml_responses = fetch_arxiv_data(base_url, sat_date, summary_set)
-        upload_to_s3(bucket_name, sat_date, summary_set, sat_xml_responses)
-
-        sun = yesterday - timedelta(days=1)
-        sun_date = sun.strftime("%Y-%m-%d")
-        sun_xml_responses = fetch_arxiv_data(base_url, sun_date, summary_set)
-        upload_to_s3(bucket_name, sun_date, summary_set, sun_xml_responses)
-
-    if day == "Tues":
-        mon = yesterday - timedelta(days=3)
-        mon_date = mon.strftime("%Y-%m-%d")
-        mon_xml_responses = fetch_arxiv_data(base_url, mon_date, summary_set)
-        upload_to_s3(bucket_name, mon_date, summary_set, mon_xml_responses)
-
-        sat = yesterday - timedelta(days=2)
-        sat_date = sat.strftime("%Y-%m-%d")
-        sat_xml_responses = fetch_arxiv_data(base_url, sat_date, summary_set)
-        upload_to_s3(bucket_name, sat_date, summary_set, sat_xml_responses)
-
-        sun = yesterday - timedelta(days=1)
-        sun_date = sun.strftime("%Y-%m-%d")
-        sun_xml_responses = fetch_arxiv_data(base_url, sun_date, summary_set)
-        upload_to_s3(bucket_name, sun_date, summary_set, sun_xml_responses)
+    if DEBUG:
+        with open(f'test_data/test{datetime.datetime.now()}.xml', 'w') as f:
+            f.write(full_xml_responses[0])
 
     return {
         "statusCode": 200,
-        "body": f"Successfully fetched arXiv daily summaries from {from_date}",
+        "body": f"Successfully fetched arXiv daily summaries from {from_date}"
     }
 
 
-def fetch_arxiv_data(base_url: str, from_date: str, summary_set: str) -> List[str]:
-    """
-    Fetches arXiv daily summaries from the specified date.
+def fetch_data(base_url: str, from_date: str, summary_set: str) -> List[str]:
+    """Fetches XML summaries from arXiv.
 
     Args:
-        base_url (str): The base URL of the arXiv OAI-PMH endpoint.
-        from_date (str): The date from which to fetch daily summaries.
-        summary_set (str): The set of daily summaries to fetch.
+        base_url (str): Base URL for fetching data.
+        from_date (str): Date for summaries.
+        summary_set (str): Summary set to fetch.
 
     Returns:
-        List[str]: A list of XML responses from the arXiv OAI-PMH endpoint.
+        List[str]: List of fetched XML summaries.
     """
-    params = initialize_params(from_date, summary_set)
     full_xml_responses = []
-
+    params = {'verb': 'ListRecords', 'set': summary_set, 'metadataPrefix': 'oai_dc', 'from': from_date}
+    logging.info(f"Request parameters: {params}")
     while True:
-        response, resumption_token = fetch_data_from_endpoint(base_url, params)
-        if response:
-            full_xml_responses.append(response)
+        response = fetch_http_response(base_url, params)
+        if response.status_code != 200:
+            logging.error(f"HTTP error, probably told to back off: {response.status_code}")
+            backoff_time = handle_http_error(response)
+            if backoff_time:
+                time.sleep(backoff_time)
+                continue
+            else:
+                break
 
+        xml_content = response.text
+        full_xml_responses.append(xml_content)
+
+        resumption_token = extract_resumption_token(xml_content)
         if resumption_token:
-            params = {"verb": "ListRecords", "resumptionToken": resumption_token}
+            logging.info(f"Resumption token: {resumption_token}")
+            params = {'verb': 'ListRecords', 'resumptionToken': resumption_token}
             time.sleep(5)
         else:
             break
@@ -102,118 +86,74 @@ def fetch_arxiv_data(base_url: str, from_date: str, summary_set: str) -> List[st
     return full_xml_responses
 
 
-def initialize_params(from_date: str, summary_set: str) -> dict:
-    """
-    Initializes the parameters for the arXiv OAI-PMH endpoint.
+def fetch_http_response(base_url: str, params: dict) -> requests.Response:
+    """Fetches HTTP response.
 
     Args:
-        from_date (str): The date from which to fetch daily summaries.
-        summary_set (str): The set of daily summaries to fetch.
+        base_url (str): Base URL for the API.
+        params (dict): Request parameters.
 
     Returns:
-        dict: A dict of parameters for the arXiv OAI-PMH endpoint.
+        requests.Response: Response object.
     """
-    return {
-        "verb": "ListRecords",
-        "set": summary_set,
-        "metadataPrefix": "oai_dc",
-        "from": from_date,
-    }
+    return requests.get(base_url, params=params)
 
 
-def fetch_data_from_endpoint(
-    base_url: str, params: dict
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Fetches data from the arXiv OAI-PMH endpoint.
+def handle_http_error(response: requests.Response) -> int:
+    """Handles HTTP errors.
 
     Args:
-        base_url (str): The base URL of the arXiv OAI-PMH endpoint.
-        params (dict): A dict of parameters for the arXiv OAI-PMH endpoint.
+        response (requests.Response): HTTP response.
 
     Returns:
-        Tuple[Optional[str], Optional[str]]: A tuple containing the XML response and resumption token.
+        int: Backoff time if needed, otherwise 0.
     """
     backoff_times = [30, 120]
-    resumption_token = None
-
-    try:
-        print(f"Fetching arxiv research summaries with parameters: {params}")
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-
-        root = ET.fromstring(response.content)
-        resumption_token_element = find_resumption_token(root)
-
-        if resumption_token_element:
-            resumption_token = resumption_token_element.text
-            print(f"Found resumptionToken: {resumption_token}")
-
-        return response.text, resumption_token
-
-    except requests.exceptions.HTTPError as e:
-        handle_http_error(e, response, backoff_times)
-
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-
-    return None, None
-
-
-def find_resumption_token(root: ET.Element) -> Optional[ET.Element]:
-    """
-    Finds the resumption token in the XML response.
-
-    Args:
-        root (ET.Element): The root element of the XML response.
-
-    Returns:
-        Optional[ET.Element]: The resumption token element.
-    """
-    return root.find(".//{http://www.openarchives.org/OAI/2.0/}resumptionToken")
-
-
-def handle_http_error(
-    e: Exception, response: requests.Response, backoff_times: List[int]
-):
-    """
-    Handles HTTP errors.
-
-    Args:
-        e (Exception): The exception that was raised.
-        response (requests.Response): The response from the arXiv OAI-PMH endpoint.
-        backoff_times (List[int]): A list of backoff times.
-
-    Returns:
-        None
-    """
-    print(f"HTTP error occurred: {e}")
     if response.status_code == 503:
-        backoff_time = response.headers.get(
-            "Retry-After", backoff_times.pop(0) if backoff_times else 30
-        )
-        print(f"Received 503 error, backing off for {backoff_time} seconds.")
-        time.sleep(int(backoff_time))
+        logging.info(f"Received 503, retrying after {backoff_times[0]} seconds")
+        return response.headers.get('Retry-After', backoff_times.pop(0) if backoff_times else 30)
+    return 0
 
 
-def upload_to_s3(
-    bucket_name: str, from_date: str, summary_set: str, full_xml_responses: List[str]
-):
-    """
-    Uploads the XML responses to S3.
+def extract_resumption_token(xml_content: str) -> str:
+    """Extracts resumption token from XML content.
 
     Args:
-        bucket_name (str): The name of the S3 bucket.
-        from_date (str): The date from which to fetch daily summaries.
-        summary_set (str): The set of daily summaries to fetch.
-        full_xml_responses (List[str]): A list of XML responses from the arXiv OAI-PMH endpoint.
+        xml_content (str): XML content.
 
     Returns:
-        None
+        str: Resumption token.
     """
+    root = ET.fromstring(xml_content)
+    token_element = root.find(".//{http://www.openarchives.org/OAI/2.0/}resumptionToken")
+    return token_element.text if token_element is not None else ''
+
+
+def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_responses: List[str]):
+    """Uploads XML responses to S3.
+
+    Args:
+        bucket_name (str): S3 bucket name.
+        from_date (str): Summary date.
+        summary_set (str): Summary set.
+        full_xml_responses (List[str]): XML responses.
+    """
+    logging.info(f"Uploading {len(full_xml_responses)} XML responses to S3")
     s3 = boto3.client("s3")
-    s3.put_object(
-        Body=json.dumps(full_xml_responses),
-        Bucket=bucket_name,
-        Key=f"arxiv/{summary_set}-{from_date}.json",
-    )
+    for idx, xml_response in enumerate(full_xml_responses):
+        s3.put_object(
+            Body=xml_response,
+            Bucket=bucket_name,
+            Key=f"arxiv/{summary_set}-{from_date}-{idx}.xml",
+        )
+
+
+if __name__ == "__main__":
+    event = {
+        "base_url": "http://export.arxiv.org/oai2",
+        "bucket_name": "techcraftingai-inbound-data",
+        "from_date": "2023-10-24",
+        "summary_set": "cs",
+    }
+    DEBUG = True
+    lambda_handler(event, None)

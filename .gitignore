@@ -221,3 +221,4 @@ package/*
 *.zip
 
 .coverage
+test_data/
