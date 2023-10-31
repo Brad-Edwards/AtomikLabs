@@ -36,7 +36,8 @@ def generate_date_list(start_date_str: str, end_date_str: str) -> List[str]:
     start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
     delta = end_date - start_date
-    return [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(delta.days)]
+    return [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((delta.days) + 1)]
+
 
 
 def finalize_db(conn, cursor):
@@ -175,6 +176,7 @@ def lambda_handler(event: dict, context) -> dict:
     if earliest_unfetched_date:
         full_xml_responses = fetch_data(base_url, earliest_unfetched_date, summary_set)
         date_list = generate_date_list(earliest_unfetched_date, today)
+        logging.info(f"Date list: {date_list}")
 
         for date_to_fetch in date_list:
             logging.info(f"Fetching for date: {date_to_fetch}")
@@ -294,5 +296,5 @@ def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_re
         s3.put_object(
             Body=xml_response,
             Bucket=bucket_name,
-            Key=f"arxiv/{summary_set}-{from_date}-{timestamp}-{idx}.xml",
+            Key=f"arxiv/{summary_set}-{from_date}-{idx}.xml",
         )
