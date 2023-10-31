@@ -1,49 +1,197 @@
-import datetime
+from datetime import datetime, timedelta
 import logging
+import os
 import time
 from typing import List
 
 import boto3
+import psycopg2
 import requests
 import xml.etree.ElementTree as ET
 
-DEBUG = False
+
+logging.getLogger().setLevel(logging.INFO)
+
+def initialize_db() -> (psycopg2.extensions.connection, psycopg2.extensions.cursor):
+    """
+    Initializes database connection.
+
+    Returns:
+        psycopg2.extensions.connection: Database connection.
+        psycopg2.extensions.cursor: Database cursor.
+    """
+    conn = psycopg2.connect(
+        host=os.environ.get("DATABASE_HOST"),
+        port=os.environ.get("DATABASE_PORT"),
+        user=os.environ.get("DATABASE_USER"),
+        password=os.environ.get("DATABASE_PASSWORD"),
+        dbname=os.environ.get("DATABASE_NAME"),
+        sslmode=os.environ.get("DATABASE_SSL_MODE"),
+    )
+    cursor = conn.cursor()
+    return conn, cursor
 
 
-logging.basicConfig(
-    filename='arxiv_fetch_daily_summaries.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+def generate_date_list(start_date_str: str, end_date_str: str) -> List[str]:
+    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+    delta = end_date - start_date
+    return [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(delta.days)]
+
+
+def finalize_db(conn, cursor):
+    """
+    Finalizes database connection.
+
+    Args:
+        conn (psycopg2.extensions.connection): Database connection.
+        cursor (psycopg2.extensions.cursor): Database cursor.
+    """
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def process_fetch(base_url, from_date, summary_set, bucket_name, cursor, fetched_data) -> bool:
+    success = any("<dc:date>" + from_date + "</dc:date>" in xml for xml in fetched_data)
+
+    if success:
+        upload_to_s3(bucket_name, from_date, summary_set, fetched_data)
+        set_fetch_success(from_date, cursor)
+    else:
+        set_fetch_failure(from_date, cursor)
+
+    return success
+
+
+def calculate_from_date() -> str:
+    """Calculates from date for fetching summaries.
+
+    Returns:
+        str: From date.
+    """
+    today = datetime.today()
+    yesterday = today - timedelta(days=1)
+    return yesterday.strftime("%Y-%m-%d")
+
+
+def insert_fetch_status(date, cursor):
+    """
+    Inserts fetch status as 'pending' for the given date.
+
+    Args:
+        date (str): Date for which to insert fetch status.
+        cursor: Database cursor.
+    """
+    cursor.execute(
+        "INSERT INTO research_fetch_status (fetch_date, status) VALUES (%s, 'pending') ON CONFLICT (fetch_date) DO NOTHING",
+        (date,)
+    )
+
+
+def set_fetch_success(date, cursor):
+    """
+    Sets fetch status as 'success' for the given date.
+
+    Args:
+        date (str): Date for which to set fetch status.
+        cursor: Database cursor.
+    """
+    cursor.execute(
+        "UPDATE research_fetch_status SET status = 'success' WHERE fetch_date = %s",
+        (date,)
+    )
+
+
+def set_fetch_failure(date, cursor):
+    """
+    Sets fetch status as 'failure' for the given date.
+
+    Args:
+        date (str): Date for which to set fetch status.
+        cursor: Database cursor.
+    """
+    cursor.execute(
+        "UPDATE research_fetch_status SET status = 'failure', retries = retries + 1 WHERE fetch_date = %s",
+        (date,)
+    )
+
+
+def get_earliest_unfetched_date(cursor, days=5) -> str:
+    """
+    Gets the earliest unfetched date.
+
+    Args:
+        cursor: Database cursor.
+        days (int): Number of days to look back.
+
+    Returns:
+        str: Earliest unfetched date.
+    """
+    today = datetime.today()
+    past_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, days + 1)]
+
+    try:
+        cursor.execute(
+            "SELECT fetch_date FROM research_fetch_status WHERE fetch_date = ANY(%s::DATE[]) AND status = 'success'",
+            (past_dates,)
+        )
+        fetched_dates = [result[0].strftime("%Y-%m-%d") for result in cursor.fetchall()]
+        unfetched_dates = list(set(past_dates) - set(fetched_dates))
+
+        earliest_date = min(unfetched_dates) if unfetched_dates else None
+    except Exception as e:
+        logging.error(f"Database query failed: {str(e)}")
+        earliest_date = None
+
+    return earliest_date or (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def lambda_handler(event: dict, context) -> dict:
-    """Main function to fetch arXiv summaries and upload them to S3.
+    """
+    The main entry point for the Lambda function.
 
     Args:
-        event (dict): Event data containing parameters.
-        context: AWS Lambda context.
+        event (dict): The event data.
+        context: The context data.
 
     Returns:
-        dict: Response with status and message.
+        dict: A dict with the status code and body.
     """
     logging.info(f"Received event: {event}")
     logging.info("Starting to fetch arXiv daily summaries")
+
     base_url = event.get("base_url")
     bucket_name = event.get("bucket_name")
-    from_date = event.get("from_date")
     summary_set = event.get("summary_set")
 
-    full_xml_responses = fetch_data(base_url, from_date, summary_set)
-    upload_to_s3(bucket_name, from_date, summary_set, full_xml_responses)
+    conn, cursor = initialize_db()
 
-    if DEBUG:
-        with open(f'test_data/test{datetime.datetime.now()}.xml', 'w') as f:
-            f.write(full_xml_responses[0])
+    today = calculate_from_date()
+    insert_fetch_status(today, cursor)
+
+    earliest_unfetched_date = get_earliest_unfetched_date(cursor)
+    logging.info(f"Earliest unfetched date: {earliest_unfetched_date}")
+    if earliest_unfetched_date:
+        full_xml_responses = fetch_data(base_url, earliest_unfetched_date, summary_set)
+        date_list = generate_date_list(earliest_unfetched_date, today)
+
+        for date_to_fetch in date_list:
+            logging.info(f"Fetching for date: {date_to_fetch}")
+            insert_fetch_status(date_to_fetch, cursor)
+            success = process_fetch(base_url, date_to_fetch, summary_set, bucket_name, cursor, full_xml_responses)
+            if success:
+                logging.info(f"Fetch successful for date: {date_to_fetch}")
+            else:
+                logging.error(f"Fetch failed for date: {date_to_fetch}")
+        else:
+            logging.warning(f"No unfetched dates found")
+
+    finalize_db(conn, cursor)
 
     return {
         "statusCode": 200,
-        "body": f"Successfully fetched arXiv daily summaries from {from_date}"
+        "body": f"Attempted fetch for date: {earliest_unfetched_date}"
     }
 
 
@@ -140,20 +288,11 @@ def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_re
     """
     logging.info(f"Uploading {len(full_xml_responses)} XML responses to S3")
     s3 = boto3.client("s3")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
     for idx, xml_response in enumerate(full_xml_responses):
         s3.put_object(
             Body=xml_response,
             Bucket=bucket_name,
-            Key=f"arxiv/{summary_set}-{from_date}-{idx}.xml",
+            Key=f"arxiv/{summary_set}-{from_date}-{timestamp}-{idx}.xml",
         )
-
-
-if __name__ == "__main__":
-    event = {
-        "base_url": "http://export.arxiv.org/oai2",
-        "bucket_name": "techcraftingai-inbound-data",
-        "from_date": "2023-10-24",
-        "summary_set": "cs",
-    }
-    DEBUG = True
-    lambda_handler(event, None)
