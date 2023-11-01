@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import logging
 import os
+import re
 import time
 from typing import List
 
@@ -11,6 +12,7 @@ import xml.etree.ElementTree as ET
 
 
 logging.getLogger().setLevel(logging.INFO)
+
 
 def initialize_db() -> (psycopg2.extensions.connection, psycopg2.extensions.cursor):
     """
@@ -39,7 +41,6 @@ def generate_date_list(start_date_str: str, end_date_str: str) -> List[str]:
     return [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((delta.days) + 1)]
 
 
-
 def finalize_db(conn, cursor):
     """
     Finalizes database connection.
@@ -54,7 +55,8 @@ def finalize_db(conn, cursor):
 
 
 def process_fetch(base_url, from_date, summary_set, bucket_name, cursor, fetched_data) -> bool:
-    success = any("<dc:date>" + from_date + "</dc:date>" in xml for xml in fetched_data)
+    pattern = r"</dc:description>\s+<dc:date>" + re.escape(from_date) + r"</dc:date>\s+<dc:type>text</dc:type>"
+    success = any(re.search(pattern, xml) for xml in fetched_data)
 
     if success:
         upload_to_s3(bucket_name, from_date, summary_set, fetched_data)
@@ -113,7 +115,7 @@ def set_fetch_failure(date, cursor):
         cursor: Database cursor.
     """
     cursor.execute(
-        "UPDATE research_fetch_status SET status = 'failure', retries = retries + 1 WHERE fetch_date = %s",
+        "UPDATE research_fetch_status SET status = 'failure', retry_count = retry_count + 1 WHERE fetch_date = %s",
         (date,)
     )
 
@@ -197,32 +199,59 @@ def lambda_handler(event: dict, context) -> dict:
     }
 
 
+def schedule_for_later():
+    future_time = datetime.utcnow() + timedelta(hours=5)
+
+    cron_time = future_time.strftime('%M %H %d %m ? %Y')
+
+    client = boto3.client('events')
+
+    response = client.put_rule(
+        Name='DynamicRule',
+        ScheduleExpression=f'cron({cron_time})',
+        State='ENABLED'
+    )
+
+    rule_arn = response['RuleArn']
+
+    client.put_targets(
+        Rule='DynamicRule',
+        Targets=[
+            {
+                'Id': 'ArxivFetchDailySummaries',
+                'Arn': os.environ.get('LAMBDA_ARN')
+            }
+        ]
+    )
+
+
 def fetch_data(base_url: str, from_date: str, summary_set: str) -> List[str]:
-    """Fetches XML summaries from arXiv.
+    """
+    Fetches data from the API.
 
     Args:
-        base_url (str): Base URL for fetching data.
-        from_date (str): Date for summaries.
-        summary_set (str): Summary set to fetch.
+        base_url (str): Base URL for the API.
+        from_date (str): Summary date.
+        summary_set (str): Summary set.
 
     Returns:
-        List[str]: List of fetched XML summaries.
+        List[str]: List of XML responses.
     """
     full_xml_responses = []
     params = {'verb': 'ListRecords', 'set': summary_set, 'metadataPrefix': 'oai_dc', 'from': from_date}
-    logging.info(f"Request parameters: {params}")
+    retry_count = 0
     while True:
-        response = fetch_http_response(base_url, params)
-        if response.status_code != 200:
-            logging.error(f"HTTP error, probably told to back off: {response.status_code}")
-            backoff_time = handle_http_error(response)
+        status_code, xml_content = fetch_http_response(base_url, params)
+        if status_code != 200:
+            logging.error(f"HTTP error, probably told to back off: {status_code}")
+            backoff_time = handle_http_error(status_code, xml_content, retry_count)
             if backoff_time:
                 time.sleep(backoff_time)
+                retry_count += 1
                 continue
             else:
                 break
 
-        xml_content = response.text
         full_xml_responses.append(xml_content)
 
         resumption_token = extract_resumption_token(xml_content)
@@ -236,7 +265,7 @@ def fetch_data(base_url: str, from_date: str, summary_set: str) -> List[str]:
     return full_xml_responses
 
 
-def fetch_http_response(base_url: str, params: dict) -> requests.Response:
+def fetch_http_response(base_url: str, params: dict) -> tuple[int, str]:
     """Fetches HTTP response.
 
     Args:
@@ -246,22 +275,29 @@ def fetch_http_response(base_url: str, params: dict) -> requests.Response:
     Returns:
         requests.Response: Response object.
     """
-    return requests.get(base_url, params=params)
+    response = requests.get(base_url, params=params)
+    return response.status_code, response.text
 
 
-def handle_http_error(response: requests.Response) -> int:
-    """Handles HTTP errors.
+def handle_http_error(status_code: int, response_text: str, retry_count: int) -> int:
+    """
+    Handles HTTP error.
 
     Args:
-        response (requests.Response): HTTP response.
+        status_code (int): HTTP status code.
+        response_text (str): Response text.
+        retry_count (int): Retry count.
 
     Returns:
-        int: Backoff time if needed, otherwise 0.
+        int: Backoff time.
     """
+    if "maintenance" in response_text.lower():
+        schedule_for_later()
+        return 0
     backoff_times = [30, 120]
-    if response.status_code == 503:
-        logging.info(f"Received 503, retrying after {backoff_times[0]} seconds")
-        return response.headers.get('Retry-After', backoff_times.pop(0) if backoff_times else 30)
+    if status_code == 503 and retry_count < len(backoff_times):
+        logging.info(f"Received 503, retrying after {backoff_times[retry_count]} seconds")
+        return backoff_times[retry_count]
     return 0
 
 
@@ -290,7 +326,6 @@ def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_re
     """
     logging.info(f"Uploading {len(full_xml_responses)} XML responses to S3")
     s3 = boto3.client("s3")
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     for idx, xml_response in enumerate(full_xml_responses):
         s3.put_object(
