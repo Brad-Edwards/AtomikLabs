@@ -14,6 +14,64 @@ import xml.etree.ElementTree as ET
 logging.getLogger().setLevel(logging.INFO)
 
 
+def lambda_handler(event: dict, context) -> dict:
+    """
+    The main entry point for the Lambda function.
+
+    Args:
+        event (dict): The event data.
+        context: The context data.
+
+    Returns:
+        dict: A dict with the status code and body.
+    """
+    log_initial_info(event)
+    base_url, bucket_name, summary_set = get_event_params(event)
+
+    conn, cursor = initialize_db()
+
+    today = calculate_from_date()
+    insert_fetch_status(today, cursor)
+
+    earliest_unfetched_date = get_earliest_unfetched_date(cursor)
+    logging.info(f"Earliest unfetched date: {earliest_unfetched_date}")
+
+    attempt_fetch_for_dates(base_url, summary_set, bucket_name, cursor, today, earliest_unfetched_date)
+
+    finalize_db(conn, cursor)
+
+    return {
+        "statusCode": 200,
+        "body": f"Attempted fetch for date: {earliest_unfetched_date}"
+    }
+
+
+def log_initial_info(event: dict) -> None:
+    """
+    Logs initial info.
+
+    Args:
+        event (dict): Event.
+    """
+    logging.info(f"Received event: {event}")
+    logging.info("Starting to fetch arXiv daily summaries")
+
+
+def get_event_params(event: dict) -> (str, str, str):
+    """
+    Gets event parameters.
+
+    Args:
+        event (dict): Event.
+
+    Returns:
+        str: Base URL.
+        str: S3 bucket name.
+        str: Summary set.
+    """
+    return event.get("base_url"), event.get("bucket_name"), event.get("summary_set")
+
+
 def initialize_db() -> (psycopg2.extensions.connection, psycopg2.extensions.cursor):
     """
     Initializes database connection.
@@ -34,39 +92,6 @@ def initialize_db() -> (psycopg2.extensions.connection, psycopg2.extensions.curs
     return conn, cursor
 
 
-def generate_date_list(start_date_str: str, end_date_str: str) -> List[str]:
-    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-    delta = end_date - start_date
-    return [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((delta.days) + 1)]
-
-
-def finalize_db(conn, cursor):
-    """
-    Finalizes database connection.
-
-    Args:
-        conn (psycopg2.extensions.connection): Database connection.
-        cursor (psycopg2.extensions.cursor): Database cursor.
-    """
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-
-def process_fetch(base_url, from_date, summary_set, bucket_name, cursor, fetched_data) -> bool:
-    pattern = r"</dc:description>\s+<dc:date>" + re.escape(from_date) + r"</dc:date>\s+<dc:type>text</dc:type>"
-    success = any(re.search(pattern, xml) for xml in fetched_data)
-
-    if success:
-        upload_to_s3(bucket_name, from_date, summary_set, fetched_data)
-        set_fetch_success(from_date, cursor)
-    else:
-        set_fetch_failure(from_date, cursor)
-
-    return success
-
-
 def calculate_from_date() -> str:
     """Calculates from date for fetching summaries.
 
@@ -76,48 +101,6 @@ def calculate_from_date() -> str:
     today = datetime.today()
     yesterday = today - timedelta(days=1)
     return yesterday.strftime("%Y-%m-%d")
-
-
-def insert_fetch_status(date, cursor):
-    """
-    Inserts fetch status as 'pending' for the given date.
-
-    Args:
-        date (str): Date for which to insert fetch status.
-        cursor: Database cursor.
-    """
-    cursor.execute(
-        "INSERT INTO research_fetch_status (fetch_date, status) VALUES (%s, 'pending') ON CONFLICT (fetch_date) DO NOTHING",
-        (date,)
-    )
-
-
-def set_fetch_success(date, cursor):
-    """
-    Sets fetch status as 'success' for the given date.
-
-    Args:
-        date (str): Date for which to set fetch status.
-        cursor: Database cursor.
-    """
-    cursor.execute(
-        "UPDATE research_fetch_status SET status = 'success' WHERE fetch_date = %s",
-        (date,)
-    )
-
-
-def set_fetch_failure(date, cursor):
-    """
-    Sets fetch status as 'failure' for the given date.
-
-    Args:
-        date (str): Date for which to set fetch status.
-        cursor: Database cursor.
-    """
-    cursor.execute(
-        "UPDATE research_fetch_status SET status = 'failure', retry_count = retry_count + 1 WHERE fetch_date = %s",
-        (date,)
-    )
 
 
 def get_earliest_unfetched_date(cursor, days=5) -> str:
@@ -150,31 +133,50 @@ def get_earliest_unfetched_date(cursor, days=5) -> str:
     return earliest_date or (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-def lambda_handler(event: dict, context) -> dict:
+def insert_fetch_status(date, cursor):
     """
-    The main entry point for the Lambda function.
+    Inserts fetch status as 'pending' for the given date.
 
     Args:
-        event (dict): The event data.
-        context: The context data.
+        date (str): Date for which to insert fetch status.
+        cursor: Database cursor.
+    """
+    cursor.execute(
+        "INSERT INTO research_fetch_status (fetch_date, status) VALUES (%s, 'pending') ON CONFLICT (fetch_date) DO NOTHING",
+        (date,)
+    )
+
+
+def generate_date_list(start_date_str: str, end_date_str: str) -> List[str]:
+    """
+    Generates a list of dates between the given start and end dates.
+
+    Args:
+        start_date_str (str): Start date.
+        end_date_str (str): End date.
 
     Returns:
-        dict: A dict with the status code and body.
+        List[str]: List of dates.
     """
-    logging.info(f"Received event: {event}")
-    logging.info("Starting to fetch arXiv daily summaries")
+    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+    delta = end_date - start_date
+    return [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((delta.days) + 1)]
 
-    base_url = event.get("base_url")
-    bucket_name = event.get("bucket_name")
-    summary_set = event.get("summary_set")
 
-    conn, cursor = initialize_db()
+def attempt_fetch_for_dates(base_url: str, summary_set: str, bucket_name: str, cursor: psycopg2.extensions.cursor,
+                            today: str, earliest_unfetched_date: str):
+    """
+    Fetches arXiv daily summaries for the given dates.
 
-    today = calculate_from_date()
-    insert_fetch_status(today, cursor)
-
-    earliest_unfetched_date = get_earliest_unfetched_date(cursor)
-    logging.info(f"Earliest unfetched date: {earliest_unfetched_date}")
+    Args:
+        base_url (str): Base URL for the API.
+        summary_set (str): Summary set.
+        bucket_name (str): S3 bucket name.
+        cursor: Database cursor.
+        today (str): Today's date.
+        earliest_unfetched_date (str): Earliest unfetched date.
+    """
     if earliest_unfetched_date:
         full_xml_responses = fetch_data(base_url, earliest_unfetched_date, summary_set)
         date_list = generate_date_list(earliest_unfetched_date, today)
@@ -183,46 +185,13 @@ def lambda_handler(event: dict, context) -> dict:
         for date_to_fetch in date_list:
             logging.info(f"Fetching for date: {date_to_fetch}")
             insert_fetch_status(date_to_fetch, cursor)
-            success = process_fetch(base_url, date_to_fetch, summary_set, bucket_name, cursor, full_xml_responses)
+            success = process_fetch(date_to_fetch, summary_set, bucket_name, cursor, full_xml_responses)
             if success:
                 logging.info(f"Fetch successful for date: {date_to_fetch}")
             else:
                 logging.error(f"Fetch failed for date: {date_to_fetch}")
-        else:
-            logging.warning(f"No unfetched dates found")
-
-    finalize_db(conn, cursor)
-
-    return {
-        "statusCode": 200,
-        "body": f"Attempted fetch for date: {earliest_unfetched_date}"
-    }
-
-
-def schedule_for_later():
-    future_time = datetime.utcnow() + timedelta(hours=5)
-
-    cron_time = future_time.strftime('%M %H %d %m ? %Y')
-
-    client = boto3.client('events')
-
-    response = client.put_rule(
-        Name='DynamicRule',
-        ScheduleExpression=f'cron({cron_time})',
-        State='ENABLED'
-    )
-
-    rule_arn = response['RuleArn']
-
-    client.put_targets(
-        Rule='DynamicRule',
-        Targets=[
-            {
-                'Id': 'ArxivFetchDailySummaries',
-                'Arn': os.environ.get('LAMBDA_ARN')
-            }
-        ]
-    )
+    else:
+        logging.warning(f"No unfetched dates found")
 
 
 def fetch_data(base_url: str, from_date: str, summary_set: str) -> List[str]:
@@ -315,6 +284,60 @@ def extract_resumption_token(xml_content: str) -> str:
     return token_element.text if token_element is not None else ''
 
 
+def process_fetch(from_date, summary_set, bucket_name, cursor, fetched_data) -> bool:
+    """
+    Processes the fetched data and uploads to S3.
+
+    Args:
+        from_date (str): Summary date.
+        summary_set (str): Summary set.
+        bucket_name (str): S3 bucket name.
+        cursor: Database cursor.
+        fetched_data (List[str]): List of XML responses.
+
+    Returns:
+        bool: True if fetch was successful, False otherwise.
+    """
+    pattern = r"</dc:description>\s+<dc:date>" + re.escape(from_date) + r"</dc:date>\s+<dc:type>text</dc:type>"
+    success = any(re.search(pattern, xml) for xml in fetched_data)
+
+    if success:
+        upload_to_s3(bucket_name, from_date, summary_set, fetched_data)
+        set_fetch_success(from_date, cursor)
+    else:
+        set_fetch_failure(from_date, cursor)
+
+    return success
+
+
+def set_fetch_success(date, cursor):
+    """
+    Sets fetch status as 'success' for the given date.
+
+    Args:
+        date (str): Date for which to set fetch status.
+        cursor: Database cursor.
+    """
+    cursor.execute(
+        "UPDATE research_fetch_status SET status = 'success' WHERE fetch_date = %s",
+        (date,)
+    )
+
+
+def set_fetch_failure(date, cursor):
+    """
+    Sets fetch status as 'failure' for the given date.
+
+    Args:
+        date (str): Date for which to set fetch status.
+        cursor: Database cursor.
+    """
+    cursor.execute(
+        "UPDATE research_fetch_status SET status = 'failure', retry_count = retry_count + 1 WHERE fetch_date = %s",
+        (date,)
+    )
+
+
 def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_responses: List[str]):
     """Uploads XML responses to S3.
 
@@ -333,3 +356,43 @@ def upload_to_s3(bucket_name: str, from_date: str, summary_set: str, full_xml_re
             Bucket=bucket_name,
             Key=f"arxiv/{summary_set}-{from_date}-{idx}.xml",
         )
+
+
+def finalize_db(conn, cursor) -> None:
+    """
+    Finalizes database connection.
+
+    Args:
+        conn (psycopg2.extensions.connection): Database connection.
+        cursor (psycopg2.extensions.cursor): Database cursor.
+    """
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def schedule_for_later() -> None:
+    """
+    Schedules the Lambda function for later.
+    """
+    future_time = datetime.utcnow() + timedelta(hours=5)
+
+    cron_time = future_time.strftime('%M %H %d %m ? %Y')
+
+    client = boto3.client('events')
+
+    response = client.put_rule(
+        Name='DynamicRule',
+        ScheduleExpression=f'cron({cron_time})',
+        State='ENABLED'
+    )
+
+    client.put_targets(
+        Rule='DynamicRule',
+        Targets=[
+            {
+                'Id': 'ArxivFetchDailySummaries',
+                'Arn': os.environ.get('LAMBDA_ARN')
+            }
+        ]
+    )
