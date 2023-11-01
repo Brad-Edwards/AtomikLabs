@@ -3,6 +3,7 @@
 import datetime
 import json
 import logging
+import os
 from collections import defaultdict
 from typing import List, Dict, Union
 
@@ -11,7 +12,7 @@ import xml.etree.ElementTree as ET
 from botocore.client import BaseClient
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
-DEBUG = False
+DEBUG = os.environ.get('DEBUG', False)
 
 logging.basicConfig(
     filename='arxiv_summary_parser.log',
@@ -109,7 +110,9 @@ def fetch_s3_object(client: BaseClient, bucket: str, key: str) -> str:
         logging.error(f"Error fetching S3 object for key {key}: {str(e)}")
         raise
 
-    return decode_s3_object(response['Body'].read().decode('utf-8').strip(), key)
+    sanitized_data = ''.join(ch for ch in response['Body'].read().decode('utf-8').strip()
+                             if ch in {'\n', '\r'} or 32 <= ord(ch) <= 126)
+    return decode_s3_object(sanitized_data, key)
 
 
 def decode_s3_object(data_str: str, key: str) -> Union[str, List[str]]:
@@ -127,6 +130,7 @@ def decode_s3_object(data_str: str, key: str) -> Union[str, List[str]]:
         logging.warning(f"Empty data received for key: {key}")
         return ""
 
+    logging.info(f"First few characters of data for key {key}: {data_str[:50]}")
     return data_str
 
 
@@ -139,15 +143,27 @@ def upload_to_s3(client: BaseClient, data: dict, key: str) -> None:
         data (dict): The data to upload.
         key (str): The key of the object.
     """
-    bucket_name = "techcraftingai-data-processing"
+    if not data:
+        logging.warning("No data to upload.")
+        return
+
     object_path = config.get('object_path')
-    object_name = f"{object_path}/{key}-parsed.json"
-    client.put_object(
-        Body=json.dumps(data),
-        Bucket=bucket_name,
-        Key=object_name,
-        ContentType='application/json'
-    )
+    if object_path is None:
+        logging.error("object_path is None in config.")
+        return
+
+    bucket_name = "techcraftingai-data-processing"
+    object_name = f"{object_path}/{key.replace('arxiv/', '')}-parsed.json"
+
+    try:
+        client.put_object(
+            Body=json.dumps(data),
+            Bucket=bucket_name,
+            Key=object_name,
+            ContentType='application/json'
+        )
+    except Exception as e:
+        logging.error(f"Failed to upload to S3: {e}")
 
 
 def extract_record_data(record, ns: dict) -> dict:
@@ -161,24 +177,28 @@ def extract_record_data(record, ns: dict) -> dict:
     Returns:
         dict: A dict with extracted data.
     """
-    identifier = record.find(".//oai:identifier", ns).text
-    abstract_url = record.find(".//dc:identifier", ns).text
+    identifier = record.find(".//oai:identifier", ns)
+    abstract_url = record.find(".//dc:identifier", ns)
     authors = extract_authors(record, ns)
     categories = extract_categories(record, ns)
     primary_category = categories[0] if categories else ""
-    abstract = record.find(".//dc:description", ns).text
-    title = record.find(".//dc:title", ns).text
-    date = record.find(".//dc:date", ns).text
+    abstract = record.find(".//dc:description", ns)
+    title = record.find(".//dc:title", ns)
+    date = record.find(".//dc:date", ns)
+
+    if any(el is None for el in [identifier, abstract_url, abstract, title, date]):
+        logging.warning("Missing essential elements in record. Skipping.")
+        return {}
 
     return {
-        'identifier': identifier,
-        'abstract_url': abstract_url,
+        'identifier': identifier.text,
+        'abstract_url': abstract_url.text,
         'authors': authors,
         'primary_category': primary_category,
         'categories': categories,
-        'abstract': abstract,
-        'title': title,
-        'date': date,
+        'abstract': abstract.text,
+        'title': title.text,
+        'date': date.text,
         'group': 'cs'
     }
 
@@ -196,7 +216,7 @@ def extract_authors(record, ns: dict) -> list:
     """
     creators_elements = record.findall(".//dc:creator", ns)
     return [{'last_name': name.text.split(", ", 1)[0],
-             'first_name': name.text.split(", ", 1)[1]}
+             'first_name': name.text.split(", ", 1)[1] if len(name.text.split(", ", 1)) > 1 else ''}
             for name in creators_elements if name.text]
 
 
@@ -213,7 +233,11 @@ def extract_categories(record, ns: dict) -> list:
     """
     subjects_elements = record.findall(".//dc:subject", ns)
     cs_categories_inverted = config.get('cs_categories_inverted')
-    return [cs_categories_inverted.get(subject.text, "") for subject in subjects_elements]
+    if cs_categories_inverted is not None:
+        return [cs_categories_inverted.get(subject.text, "") for subject in subjects_elements if subject.text is not None]
+    else:
+        logging.warning("cs_categories_inverted is not initialized.")
+    return []
 
 
 def parse_xml_data(xml_data: str) -> dict:
@@ -226,13 +250,35 @@ def parse_xml_data(xml_data: str) -> dict:
     Returns:
         dict: A dict with extracted data.
     """
-    extracted_data_chunk = defaultdict(list)
-    root = ET.fromstring(xml_data)
-    ns = {'oai': 'http://www.openarchives.org/OAI/2.0/', 'dc': 'http://purl.org/dc/elements/1.1/'}
+    if not xml_data:
+        logging.warning("Received empty or None XML data.")
+        return {}
 
-    for record in root.findall(".//oai:record", ns):
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as e:
+        logging.error(f"Failed to parse XML: {e}")
+        return {}
+
+    if root is None:
+        logging.warning("Root of XML is None.")
+        return {}
+
+    ns = {'oai': 'http://www.openarchives.org/OAI/2.0/', 'dc': 'http://purl.org/dc/elements/1.1/'}
+    if not all(namespace in xml_data for namespace in ns.values()):
+        logging.warning("Namespaces are not as expected.")
+        return {}
+
+    extracted_data_chunk = defaultdict(list)
+    records = root.findall(".//oai:record", ns)
+    if not records:
+        logging.warning("No records found in XML.")
+        return {}
+
+    for record in records:
         date_elements = record.findall(".//dc:date", ns)
         if len(date_elements) != 1:
+            logging.info("Record skipped due to multiple or zero date elements.")
             continue
         extracted_data_chunk['records'].append(extract_record_data(record, ns))
 
@@ -251,13 +297,26 @@ def lambda_handler(event: dict, context) -> dict:
         dict: A dict with the status code and body.
     """
     setup_logging()
-    s3 = boto3.client("s3")
-    bucket = event['Records'][0]['s3']['bucket']['name']
-    key = event['Records'][0]['s3']['object']['key']
-    logging.info(f"Processing arXiv daily summaries for key: {key}")
+    logging.info(f"Received event: {event}")
+    logging.info("Starting to parse arXiv daily summaries")
     try:
+        s3 = boto3.client("s3")
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+        logging.info(f"Processing arXiv daily summaries for bucket: {bucket}, key: {key}")
+    except KeyError as e:
+        logging.error(f"Malformed event: {event}. Missing key: {e}")
+        return {
+            "statusCode": 400,
+            "body": "Malformed event"
+        }
+
+    try:
+        logging.info(f"Fetching S3 object for bucket: {bucket}, key: {key}")
         xml_data = fetch_s3_object(s3, bucket, key)
+        logging.info(f"Fetched S3 object for bucket: {bucket}, key: {key}")
         extracted_data_chunk = parse_xml_data(xml_data)
+        logging.info(f"Parsed XML data for bucket: {bucket}, key: {key}")
         upload_to_s3(s3, extracted_data_chunk, key)
     except Exception as e:
         logging.error(f"Error in Lambda handler: {str(e)}")
@@ -281,4 +340,4 @@ def lambda_handler(event: dict, context) -> dict:
 if __name__ == "__main__":
     DEBUG = True
     lambda_handler({'Records': [{'s3': {'bucket': {'name': 'techcraftingai-inbound-data'},
-                                        'object': {'key': 'arxiv/cs-2023-10-20-3.xml'}}}]}, None)
+                                        'object': {'key': 'arxiv/cs-2023-10-30-1.xml'}}}]}, None)
