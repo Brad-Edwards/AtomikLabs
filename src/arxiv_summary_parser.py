@@ -3,7 +3,6 @@
 import datetime
 import json
 import logging
-import os
 from collections import defaultdict
 from typing import List, Dict, Union
 
@@ -12,20 +11,7 @@ import xml.etree.ElementTree as ET
 from botocore.client import BaseClient
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
-DEBUG = os.environ.get('DEBUG', False)
-
-logging.basicConfig(
-    filename='arxiv_summary_parser.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-
-def setup_logging():
-    """
-    Sets up logging.
-    """
-    logging.info("Starting arXiv summary parsing.")
+logging.getLogger().setLevel(logging.INFO)
 
 
 def load_config() -> Dict[str, Union[str, Dict[str, str]]]:
@@ -296,7 +282,6 @@ def lambda_handler(event: dict, context) -> dict:
     Returns:
         dict: A dict with the status code and body.
     """
-    setup_logging()
     logging.info(f"Received event: {event}")
     logging.info("Starting to parse arXiv daily summaries")
     try:
@@ -327,17 +312,7 @@ def lambda_handler(event: dict, context) -> dict:
 
     logging.info("Successfully parsed arXiv daily summaries.")
 
-    if DEBUG:
-        with open(f'../test_data/test{datetime.datetime.now()}.json', 'w') as f:
-            f.write(json.dumps(extracted_data_chunk))
-
     return {
         "statusCode": 200,
         "body": "Successfully parsed arXiv daily summaries"
     }
-
-
-if __name__ == "__main__":
-    DEBUG = True
-    lambda_handler({'Records': [{'s3': {'bucket': {'name': 'techcraftingai-inbound-data'},
-                                        'object': {'key': 'arxiv/cs-2023-10-30-1.xml'}}}]}, None)
