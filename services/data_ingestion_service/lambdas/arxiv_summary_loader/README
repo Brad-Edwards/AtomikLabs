@@ -1,0 +1,6 @@
+## Dependencies
+
+psycopg2 has to be installed manually.
+
+Needs pip install --platform=manylinux1_x86_64 --only-binary=:all: psycopg2-binary --target psycopg-binary/python/lib/python3.9/site-packages
+Also needs 3.9 version of psycopg2-binary
