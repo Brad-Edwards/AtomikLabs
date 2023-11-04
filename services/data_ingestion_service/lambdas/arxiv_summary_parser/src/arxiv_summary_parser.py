@@ -4,7 +4,7 @@ from collections import defaultdict
 import json
 import logging
 import os
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Tuple
 
 import boto3
 import xml.etree.ElementTree as ET
@@ -289,6 +289,25 @@ def load_config() -> Dict[str, Union[str, Dict[str, str]]]:
     }
 
 
+GROUP_PREFIX_MAPPING = {
+    "Computer Science": "cs",
+    "Economics": "econ",
+    "Electrical Engineering and Systems Science": "eess",
+    "Mathematics": "math",
+    "Astrophysics": "astro-ph",
+    "Condensed Matter": "cond-mat",
+    "General Relativity and Quantum Cosmology": "gr-qc",
+    "High Energy Physics": "hep",
+    "Mathematical Physics": "math-ph",
+    "Nonlinear Sciences": "nlin",
+    "Nuclear": "nucl",
+    "Physics": "physics",
+    "Quantum Physics": "quant-ph",
+    "Quantitative Biology": "q-bio",
+    "Quantitative Finance": "q-fin",
+}
+
+
 CONFIG = load_config()
 
 
@@ -568,9 +587,13 @@ def extract_record_data(record, ns: dict) -> dict:
     """
     identifier = record.find(".//oai:identifier", ns)
     abstract_url = record.find(".//dc:identifier", ns)
-    full_text_url = abstract_url.text.replace("/abs/", "/pdf/")
+    full_text_url = ""
+    if abstract_url is not None:
+        full_text_url = abstract_url.text.replace("/abs/", "/pdf/")
     authors = extract_authors(record, ns)
-    groups, categories = extract_ordered_categories_and_groups(record, ns)
+    logging.info(f"Extracted authors for record: {identifier.text}")
+    groups, categories = extract_categories_and_groups(record, ns)
+    logging.info(f"Extracted categories for record: {identifier.text}")
     groups = [group for group in groups if group]
     categories = [category for category in categories if category]
     primary_group = groups[0] if groups else ""
@@ -578,7 +601,7 @@ def extract_record_data(record, ns: dict) -> dict:
     abstract = record.find(".//dc:description", ns)
     title = record.find(".//dc:title", ns)
     date = record.find(".//dc:date", ns)
-
+    logging.info(f"Extracted data for record: {identifier.text}")
     if any(el is None for el in [identifier, abstract_url, abstract, title, date]):
         logging.warning("Missing essential elements in record. Skipping.")
         return {}
@@ -622,29 +645,63 @@ def extract_authors(record, ns: dict) -> list:
     ]
 
 
-def extract_ordered_categories_and_groups(record, ns: dict) -> tuple:
+def extract_categories_and_groups(record, ns: dict) -> Tuple[List[str], List[str]]:
     """
-    Extracts both categories and groups from an arXiv research summary record, preserving the order.
+    Extracts categories and groups from an arXiv research summary record.
 
     Args:
         record (ET.Element): The record element.
         ns (dict): A dict of namespaces.
 
     Returns:
-        tuple: A tuple containing a list of category codes and a list of group labels, both in the order they appear in the XML.
+        Tuple[List[str], List[str]]: A tuple of lists of categories and groups.
     """
     subjects_elements = record.findall(".//dc:subject", ns)
-    categories = [subject.text for subject in subjects_elements if subject.text]
+    matched_categories = []
+    matched_groups = []
 
-    ordered_group_labels = []
-    ordered_category_codes = []
+    for subject_element in subjects_elements:
+        subject_text = subject_element.text
+        if subject_text:
+            for prefix, group in GROUP_PREFIX_MAPPING.items():
+                if prefix in subject_text:
+                    category_mapping = CONFIG.get(group, {}).get("categories", {})
+                    matched_category = next(
+                        (
+                            abbr
+                            for full, abbr in category_mapping.items()
+                            if subject_text == full
+                        ),
+                        None,
+                    )
+                    if matched_category and matched_category not in matched_categories:
+                        matched_categories.append(matched_category)
+                    if group not in matched_groups:
+                        matched_groups.append(group)
+                    break
+            else:
+                logging.info(f"No match found for: {subject_text}")
 
-    for category in categories:
-        for group, data in CONFIG.items():
-            if category in data["categories"]:
-                if data["label"] not in ordered_group_labels:
-                    ordered_group_labels.append(data["label"])
-                ordered_category_codes.append(data["categories"][category])
-                break  # Stop searching if we've found the category
+    if not matched_categories:
+        matched_categories.append("Unknown")
 
-    return ordered_category_codes, ordered_group_labels
+    if not matched_groups:
+        matched_groups.append("Unknown")
+
+    return matched_groups, matched_categories
+
+
+if __name__ == "__main__":
+    lambda_handler(
+        {
+            "Records": [
+                {
+                    "s3": {
+                        "bucket": {"name": "techcraftingai-inbound-data"},
+                        "object": {"key": "arxiv/cs-2023-10-30-3.xml"},
+                    }
+                }
+            ]
+        },
+        None,
+    )
